@@ -1,0 +1,1014 @@
+// ==============================
+// Imports
+// ==============================
+const { getAssociatedTokenAddress, createTransferInstruction } = require('@solana/spl-token');
+const fetch = require('node-fetch');
+const { PublicKey, Connection, Transaction, Keypair, LAMPORTS_PER_SOL } = require('@solana/web3.js');
+const WebSocket = require('ws');
+const bip39 = require('bip39');
+require('dotenv').config();
+
+// ==============================
+// Constants
+// ==============================
+const RAYDIUM_PUBLIC_KEY = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const HTTP_URL = "https://api.mainnet-beta.solana.com";
+const RPC_DELAY = 500; // ms between RPC calls
+const BATCH_DELAY = 1500; // ms between token checks
+const RECONNECT_DELAY = 5000; // 5 seconds
+const MAX_RETRIES = 5;
+const MAX_CACHE_SIZE = 150; // Max entries in safety check cache
+const TRADE_AMOUNT_USD = 15; // $15 worth of SOL
+const SLIPPAGE = 0.3; // 30%
+const TAKE_PROFIT = 0.5; // 50% price increase
+const SIMULATION_AMOUNT = 0.01; // $0.01 test amount
+
+
+// ==============================
+// Global Variables
+// ==============================
+let rpcQueue = []; // Queue for throttled RPC calls
+let isProcessing = false; // Flag for RPC queue processing
+let retryCount = 0; // Retry counter for WebSocket connections
+let isActive = true; // Flag for script activity
+const processedTransactions = new Set(); // Track processed transactions
+const safetyCheckCache = new Map(); // Cache for safety check results
+let isProcessingSafetyCheck = false; // Global flag to track safety check status
+
+// ==============================
+// Helper Functions
+// ==============================
+function updateCache(key, value) {
+    if (safetyCheckCache.size > MAX_CACHE_SIZE) {
+        const oldestKey = safetyCheckCache.keys().next().value;
+        safetyCheckCache.delete(oldestKey);
+    }
+    safetyCheckCache.set(key, value);
+}
+
+
+async function processQueue() {
+    if (isProcessing || rpcQueue.length === 0) return;
+    isProcessing = true;
+
+    const { fn, args, resolve, reject, retries, maxRetries } = rpcQueue.shift();
+    
+    try {
+        const result = await fn(...args);
+        resolve(result);
+    } catch (error) {
+        if (error.message.includes('429') && retries < maxRetries) {
+            // Exponential backoff
+            const delay = Math.pow(2, retries) * 1000;
+            console.log(`Rate limited, retrying in ${delay}ms...`);
+            
+            rpcQueue.unshift({
+                fn,
+                args,
+                resolve,
+                reject,
+                retries: retries + 1,
+                maxRetries
+            });
+            
+            await new Promise(res => setTimeout(res, delay));
+        } else {
+            reject(error);
+        }
+    } finally {
+        await new Promise(res => setTimeout(res, RPC_DELAY));
+        isProcessing = false;
+        processQueue();
+    }
+}
+
+async function throttledRpcCall(fn, ...args) {
+    return new Promise((resolve, reject) => {
+        const request = {
+            fn,
+            args,
+            resolve,
+            reject,
+            retries: 0,
+            maxRetries: 3
+        };
+        
+        rpcQueue.push(request);
+        if (!isProcessing) processQueue();
+    });
+}
+
+// ==============================
+// Wallet Initialization (Updated)
+// ==============================
+const WALLET_ADDRESS = '9REbwrW9hNJbFANAq6xFRR9gsi3h5VBpHd9kVx1mvfC1'; // Hardcoded address
+
+function getPhantomWallet() {
+    // Temporary bypass for seed phrase validation
+    try {
+        const publicKey = new PublicKey(WALLET_ADDRESS);
+        console.log('✅ Using Predefined Wallet Address:', publicKey.toBase58());
+        return { publicKey }; // Return mock wallet object
+    } catch (error) {
+        console.error('❌ Invalid wallet address format');
+        process.exit(1);
+    }
+}
+
+const wallet = getPhantomWallet();
+
+// ==============================
+// Connection Initialization
+// ==============================
+const raydium = new PublicKey(RAYDIUM_PUBLIC_KEY);
+const connection = new Connection(HTTP_URL, {
+    commitment: "confirmed",
+    wsEndpoint: HTTP_URL.replace('https://', 'wss://') // Explicit WebSocket endpoint
+});
+
+
+// ==============================
+// WebSocket Connection Handling
+// ==============================
+async function connectWithRetry() {
+    try {
+        console.log("Attempting to connect to WebSocket...");
+
+        if (!connection._rpcWebSocket) {
+            console.error("WebSocket connection not initialized");
+            throw new Error("WebSocket connection not initialized");
+        }
+
+        if (connection._rpcWebSocket.readyState === WebSocket.CLOSED) {
+            await connection._rpcWebSocket.open();
+        }
+
+        retryCount = 0; // Reset retry counter on successful connection
+        console.log("WebSocket connected successfully");
+        await main(connection, raydium);
+
+    } catch (error) {
+        console.error("WebSocket connection failed:", error);
+
+        if (retryCount < MAX_RETRIES) {
+            retryCount++;
+            console.log(`Reconnecting in ${RECONNECT_DELAY / 1000} seconds... (Attempt ${retryCount}/${MAX_RETRIES})`);
+            setTimeout(connectWithRetry, RECONNECT_DELAY);
+        } else {
+            console.error("Max retry attempts reached. Exiting...");
+            process.exit(1);
+        }
+    }
+}
+
+function setupWebSocketHandlers() {
+    if (!connection._rpcWebSocket) {
+        console.error("WebSocket client not initialized");
+        return;
+    }
+
+    connection._rpcWebSocket.on('close', (code, reason) => {
+        console.log(`WebSocket closed: ${code} ${reason}`);
+        if (isActive && code !== 1000) { // 1000 = normal closure
+            console.log("Reconnecting...");
+            connectWithRetry();
+        }
+    });
+
+    connection._rpcWebSocket.on('error', (error) => {
+        console.error("WebSocket error:", error);
+    });
+
+    connection._rpcWebSocket.on('ping', () => {
+        connection._rpcWebSocket.pong();
+    });
+}
+
+// ==============================
+// Main Function
+// ==============================
+async function main(connection, programAddress) {
+    console.log("=== New Round ===");
+    console.log("Monitoring logs for program:", programAddress.toString());
+
+    connection.onLogs(
+        programAddress,
+        ({ logs, err, signature }) => {
+            if (err) return;
+
+            if (logs && logs.some(log => log.includes("initialize2"))) {
+                console.log("Signature for 'initialize2':", signature);
+                const discoveryTime = new Date().toISOString();
+                console.log("Discovery Time:", discoveryTime);
+                fetchRaydiumAccounts(signature, connection, discoveryTime);
+            }
+        },
+        "confirmed"
+    );
+}
+
+// ==============================
+// Start Script
+// ==============================
+connectWithRetry();
+setupWebSocketHandlers();
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+    console.log("Shutting down gracefully...");
+    isActive = false;
+    if (connection._rpcWebSocket) {
+        connection._rpcWebSocket.close();
+    }
+    process.exit();
+});
+
+// Fetch account
+async function fetchRaydiumAccounts(txId, connection, discoveryTime) {
+    const SOL_MINT = "So11111111111111111111111111111111111111112";
+
+    // Check for duplicate processing
+    if (processedTransactions.has(txId)) {
+        console.log(`Transaction ${txId} already processed, skipping...`);
+        return;
+    }
+
+    // Check if a safety check is already in progress
+    if (isProcessingSafetyCheck) {
+        console.log("Safety check already in progress. Skipping this transaction for now.");
+        return;
+    }
+
+    // Lock the safety check
+    isProcessingSafetyCheck = true;
+    processedTransactions.add(txId);
+
+    console.log("Fetching Raydium accounts with txId:", txId);
+
+    try {
+        // Log wallet balance with error handling
+        await logWalletBalance();
+
+        // Add initial processing delay
+        await delay(1500);
+
+        // Fetch transaction with retry and throttling
+        const tx = await withRetry(() =>
+            throttledRpcCall(() => connection.getParsedTransaction(txId, {
+                maxSupportedTransactionVersion: 0,
+                commitment: 'confirmed'
+            }))
+        );
+
+        if (!tx) {
+            console.log("Failed to fetch transaction details");
+            return;
+        }
+
+        // Extract accounts with error handling
+        const accounts = tx?.transaction?.message?.instructions
+            ?.find(ix => ix.programId.toBase58() === RAYDIUM_PUBLIC_KEY)?.accounts;
+
+        if (!accounts || accounts.length < 10) {
+            console.log("No valid accounts found in the transaction");
+            return;
+        }
+
+        const tokenAAccount = new PublicKey(accounts[8]);
+        const tokenBAccount = new PublicKey(accounts[9]);
+
+        // Only skip if BOTH tokens are SOL
+        const isSolPair = [tokenAAccount, tokenBAccount].every(acc => 
+            acc.toBase58() === SOL_MINT
+        );
+
+        if (isSolPair) {
+            console.log("Skipping SOL-only pair");
+            return;
+        }
+
+        // Display LP information
+        const displayData = [
+            { "Token": "A", "Account Public Key": tokenAAccount.toBase58() },
+            { "Token": "B", "Account Public Key": tokenBAccount.toBase58() }
+        ];
+
+        console.log("\nNew LP Found");
+        console.log(`Discovery Time: ${discoveryTime}`);
+        console.log(generateExplorerUrl(txId));
+        console.table(displayData);
+
+        // Perform safety checks with proper batching and delays
+        const checkStartTime = new Date();
+        console.log("\nSafety checks started at:", checkStartTime.toISOString());
+
+        // Perform safety checks for Token A and Token B
+        await performSafetyChecks(tokenAAccount);
+        console.log("Safety check for Token A completed, waiting for next check...");
+        await delay(500); // Delay between checks
+
+        await performSafetyChecks(tokenBAccount);
+        console.log("Safety check for Token B completed.");
+
+        const checkEndTime = new Date();
+        const checkDuration = checkEndTime - checkStartTime;
+
+        console.log(`\nSafety checks completed in ${(checkDuration / 1000).toFixed(2)} seconds`);
+        console.log(`Safety checks completed at: ${checkEndTime.toISOString()}`);
+
+    } catch (error) {
+        console.error("\nError processing transaction:", error);
+    } finally {
+        // Unlock the safety check
+        isProcessingSafetyCheck = false;
+    }
+
+    // Add a delay before processing the next transaction
+    console.log(`Waiting ${BATCH_DELAY / 1000} seconds before processing the next transaction...`);
+    await delay(BATCH_DELAY);  // Delay before processing the next transaction
+}
+
+
+
+
+  
+// ==============================
+// Log Wallet Balance
+// ==============================
+async function logWalletBalance() {
+    try {
+        const balance = await connection.getBalance(wallet.publicKey);
+        console.log(`Wallet Balance: ${balance / LAMPORTS_PER_SOL} SOL`);
+    } catch (error) {
+        console.error("Error fetching wallet balance:", error);
+    }
+}
+
+// Add global concurrency lock
+let safetyCheckLock = false;
+
+async function performSafetyChecks(tokenAccount) {
+    if (safetyCheckLock) {
+        console.log("Safety check already in progress. Skipping duplicate.");
+        return;
+    }
+    safetyCheckLock = true;
+
+    const cacheKey = tokenAccount.toBase58();
+
+    // Check if the result for this token is already in the cache
+    if (safetyCheckCache.has(cacheKey)) {
+        console.log(`Cache hit for token: ${tokenAccount.toBase58()}`);
+        safetyCheckLock = false; // Release lock before returning
+        return safetyCheckCache.get(cacheKey);
+    }
+
+    console.log(`\n=== Performing safety checks on token: ${tokenAccount.toBase58()} ===`);
+
+    const results = {
+        isDecentralized: null,
+        liquidityLocked: null,
+        ownerAccess: null,
+        mintAddressValid: null,
+        accountExists: null,
+        basicTxOk: null,
+        tradeOk: null,
+        approvalOk: null,
+        burnMechanism: null,
+        renounceOwnership: null,
+        tokenDistribution: null,
+        isHoneypot: null
+    };
+
+    try {
+        // Batch all account checks first
+        const requiredAccounts = [tokenAccount];
+        const accountData = await getBatchAccountInfo(requiredAccounts);
+
+        // Add delay before each check
+        await delay(BATCH_DELAY);
+
+        // 1. Core Security Checks
+        results.isDecentralized = await checkOwnership(tokenAccount, accountData);
+        console.log(results.isDecentralized ? "⚠️ Centralized token" : "✅ Decentralized token");
+
+        await delay(BATCH_DELAY);
+        // 2. Liquidity Verification
+        results.liquidityLocked = await checkIfLiquidityLocked(tokenAccount, accountData);
+        console.log(results.liquidityLocked ? "✅ Liquidity locked" : "⚠️ Liquidity unlocked");
+
+        await delay(BATCH_DELAY);
+        results.ownerAccess = await checkIfOwnerHasPoolAccess(tokenAccount, accountData);
+        console.log(results.ownerAccess ? "⚠️ Owner pool access" : "✅ No owner pool access");
+
+        await delay(BATCH_DELAY);
+        // 3. Account Validation
+        results.mintAddressValid = await checkTokenMint(tokenAccount, accountData);
+        console.log(results.mintAddressValid ? `✅ Valid mint address: ${results.mintAddressValid}` : "⚠️ Invalid mint address");
+
+        await delay(BATCH_DELAY);
+        results.accountExists = await checkTokenAccountCreation(tokenAccount, accountData);
+        console.log(results.accountExists ? "✅ Valid token account" : "⚠️ Invalid token account");
+
+        await delay(BATCH_DELAY);
+        // 4. Transaction Simulations
+        results.basicTxOk = await simulateTransaction(tokenAccount, accountData);
+        console.log(results.basicTxOk ? "✅ Basic simulation passed" : "⚠️ Basic simulation failed");
+
+        await delay(BATCH_DELAY);
+        // Use simulateTrade instead of simulateSwap
+        results.tradeOk = await simulateTrade(tokenAccount, 'buy'); // Test buy simulation
+        console.log(results.tradeOk ? "✅ Trade simulation passed" : "⚠️ Trade simulation failed");
+
+        await delay(BATCH_DELAY);
+        // 5. Advanced Checks
+        results.approvalOk = await checkApprovalAndTransfer(tokenAccount, accountData);
+        console.log(results.approvalOk ? "✅ Transfer allowed" : "⚠️ Transfer restricted");
+
+        await delay(BATCH_DELAY);
+        results.burnMechanism = await checkBurnMechanism(tokenAccount, accountData);
+        console.log(results.burnMechanism ? "✅ Burn mechanism found" : "⚠️ No burn mechanism");
+
+        await delay(BATCH_DELAY);
+        results.renounceOwnership = await checkRenounceOwnership(tokenAccount, accountData);
+        console.log(results.renounceOwnership ? "✅ Ownership renounced" : "⚠️ Ownership not renounced");
+
+        await delay(BATCH_DELAY);
+        results.tokenDistribution = await checkTokenDistribution(tokenAccount, accountData);
+        console.log(results.tokenDistribution ? "✅ Fair distribution" : "⚠️ Unfair distribution");
+
+        await delay(BATCH_DELAY);
+        // 6. Final Honeypot Check
+        results.isHoneypot = await checkHoneypot(tokenAccount);
+        console.log(results.isHoneypot ? "⚠️ Honeypot detected" : "✅ Honeypot check passed");
+
+        // Generate final report
+        console.log("\n=== FINAL REPORT ===");
+        console.table(results);
+
+        // Determine if token is safe
+        const isSafe =
+            results.liquidityLocked &&
+            !results.ownerAccess &&
+            results.mintAddressValid &&
+            results.accountExists &&
+            results.basicTxOk &&
+            results.tradeOk &&
+            results.approvalOk &&
+            results.burnMechanism &&
+            results.renounceOwnership &&
+            results.tokenDistribution &&
+            !results.isHoneypot;
+
+        if (isSafe) {
+            console.log("✅✅✅ SAFE TO BUY ✅✅✅");
+            await buyToken(tokenAccount);
+        } else {
+            console.log("❌❌❌ UNSAFE TOKEN ❌❌❌");
+        }
+
+        // Store the results in cache for future checks
+        updateCache(cacheKey, isSafe);
+        safetyCheckLock = false; // Release lock before returning
+        return isSafe;
+    } catch (error) {
+        console.error("\n=== SAFETY CHECK FAILURE ===");
+        console.error(`❌❌❌ ERROR: ${error.message}`);
+        console.table(results);
+        safetyCheckLock = false; // Release lock in case of an error
+        return false;
+    }
+}
+
+// Delay function to add the batch delay between checks
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function getSolPrice() {
+    const response = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    const data = await response.json();
+    return data.solana.usd;
+}
+
+function calculateLamports(usdAmount, solPrice) {
+    return Math.floor((usdAmount / solPrice) * LAMPORTS_PER_SOL);
+}
+
+function generateExplorerUrl(txId) {
+    return `https://solscan.io/tx/${txId}`;
+}
+
+async function getBatchAccountInfo(publicKeys) {
+    const accounts = await throttledRpcCall(() => 
+      connection.getMultipleAccountsInfo(publicKeys)
+    );
+    return accounts.reduce((acc, account, index) => {
+      acc[publicKeys[index].toBase58()] = account;
+      return acc;
+    }, {});
+  }
+
+  
+async function checkOwnership(tokenAccount) {
+    try {
+        const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+        if (!accountInfo?.value?.data?.parsed) throw new Error("Invalid token account");
+        
+        // For mint accounts
+        const mintAuthority = accountInfo.value.data.parsed.info.mintAuthority;
+        return !!mintAuthority; // true = centralized
+    } catch (error) {
+        throw new Error(`Ownership check failed: ${error.message}`);
+    }
+}
+
+async function checkTokenMint(tokenAccount) {
+    try {
+        // Use throttled RPC call to fetch account info
+        const accountInfo = await throttledRpcCall(() =>
+            connection.getParsedAccountInfo(tokenAccount)
+        );
+        
+        if (!accountInfo.value) throw new Error("Account not found");
+
+        // Check if it's a mint account
+        if (accountInfo.value.data.parsed?.info?.decimals !== undefined) {
+            return tokenAccount.toBase58(); // It's a mint account
+        }
+
+        // Retrieve and validate mint address
+        const mintAddress = accountInfo.value.data.parsed?.info?.mint;
+        if (!mintAddress) throw new Error("Mint address missing");
+
+        return mintAddress; // Return the mint address
+    } catch (error) {
+        throw new Error(`Mint validation failed: ${error.message}`);
+    }
+}
+
+const CENTRALIZED_OWNERS = [
+    "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1", // Raydium V4
+    "9rpQHSyFVM1dkkHFQ2TtTzPEW7DVmEyPmOK8v6hfaWgh"  // Orca
+];
+
+async function checkIfOwnerHasPoolAccess(tokenAccount) {
+    try {
+        const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+        if (!accountInfo.value) throw new Error("Account not found");
+
+        const owner = accountInfo.value.data.parsed?.info?.owner;
+        if (!owner) return false;
+
+        return CENTRALIZED_OWNERS.includes(owner);
+    } catch (error) {
+        throw new Error(`Owner access check failed: ${error.message}`);
+    }
+}
+
+async function checkIfLiquidityLocked(tokenAccount) {
+    console.log(`Checking if liquidity is locked for token: ${tokenAccount.toBase58()}`);
+
+    try {
+        // Fetch account info
+        const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+
+        if (!accountInfo.value) {
+            console.log("No account info found.");
+            return false;
+        }
+
+        // Check if it's a mint account
+        if (accountInfo.value.data.program === 'spl-token') {
+            const parsedAccountData = accountInfo.value.data.parsed.info;
+
+            // Check if the account has a freeze authority (indicates locked liquidity)
+            if (parsedAccountData.freezeAuthority !== null) {
+                console.log(`Token ${tokenAccount.toBase58()} has a freeze authority. Liquidity may be locked.`);
+                return true; // Liquidity is locked
+            } else {
+                console.log(`Token ${tokenAccount.toBase58()} has no freeze authority. Liquidity is not locked.`);
+                return false; // Liquidity is not locked
+            }
+        } else {
+            console.log("This is not a valid SPL token account.");
+            return false;
+        }
+    } catch (error) {
+        console.error(`Error checking liquidity lock status for token: ${tokenAccount.toBase58()}`, error);
+        return false; // Return false if error occurs
+    }
+}
+
+async function checkTokenAccountCreation(tokenAccount) {
+    console.log(`Checking if token account exists: ${tokenAccount.toBase58()}`);
+
+    const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+    if (!accountInfo.value) {
+        console.log(`Token account ${tokenAccount.toBase58()} does not exist.`);
+        return false;
+    }
+
+    console.log(`Token account ${tokenAccount.toBase58()} exists and is valid.`);
+    return true;
+}
+
+async function simulateTransaction(tokenAccount) {
+  return withRetry(async () => {
+      try {
+          const solPrice = await getSolPrice();
+          const simAmount = calculateLamports(SIMULATION_AMOUNT, solPrice);
+
+          const associatedAccount = await getAssociatedTokenAddress(
+              tokenAccount,
+              wallet.publicKey
+          );
+
+          const instruction = createTransferInstruction(
+              associatedAccount,
+              associatedAccount,
+              wallet.publicKey,
+              simAmount
+          );
+
+          const transaction = new Transaction().add(instruction);
+          const { blockhash } = await connection.getRecentBlockhash();
+          transaction.recentBlockhash = blockhash;
+          transaction.feePayer = wallet.publicKey;
+
+          const { value } = await throttledRpcCall(() => connection.simulateTransaction(transaction));
+          return !value.err;
+      } catch (error) {
+          throw new Error(`Simulation failed: ${error.message}`);
+      }
+  });
+}
+  
+async function checkApprovalAndTransfer(tokenAccount) {
+    console.log(`Checking approval and transfer settings for token: ${tokenAccount.toBase58()}`);
+
+    const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+    if (!accountInfo.value) {
+        console.log("No account info found.");
+        return false;
+    }
+
+    const data = accountInfo.value.data.parsed.info;
+    const owner = data.owner;
+
+    if (owner === "someRestrictedOwnerAddress") {
+        console.log(`Token ${tokenAccount.toBase58()} is restricted and cannot be transferred.`);
+        return false;
+    }
+
+    console.log(`Token ${tokenAccount.toBase58()} is transferable.`);
+    return true;
+}
+
+async function checkBurnMechanism(tokenAccount) {
+    try {
+        const burnMethodExists = await checkForBurnMethod(tokenAccount);
+        if (!burnMethodExists) throw new Error("No burn mechanism");
+        console.log("✅ Burn mechanism verified");
+        return true;
+    } catch (error) {
+        console.error("Burn check failed:", error.message);
+        return false;
+    }
+}
+
+async function checkForBurnMethod(tokenAccount) {
+    try {
+        // Check if token has a burn mechanism by verifying mint authority
+        const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+        const mintAuthority = accountInfo.value.data.parsed?.info?.mintAuthority;
+        
+        // If mint authority exists, burns are possible
+        return mintAuthority !== null;
+    } catch (error) {
+        throw new Error(`Burn check failed: ${error.message}`);
+    }
+}
+
+
+async function checkRenounceOwnership(tokenAccount) {
+    try {
+        const renounced = await checkForRenounceOwnershipMethod(tokenAccount);
+        if (!renounced) throw new Error("Ownership not renounced");
+        console.log("✅ Ownership renounced");
+        return true;
+    } catch (error) {
+        console.error("Ownership check failed:", error.message);
+        return false;
+    }
+}
+
+async function checkForRenounceOwnershipMethod(tokenAccount) {
+    try {
+        // Check if mint authority is null (ownership renounced)
+        const accountInfo = await connection.getParsedAccountInfo(tokenAccount);
+        const mintAuthority = accountInfo.value.data.parsed?.info?.mintAuthority;
+        
+        return mintAuthority === null;
+    } catch (error) {
+        throw new Error(`Ownership check failed: ${error.message}`);
+    }
+}
+
+async function analyzeTokenDistribution(tokenAccount) {
+    try {
+        // Get token supply and largest accounts
+        const supplyInfo = await connection.getTokenSupply(tokenAccount);
+        const largestAccounts = await connection.getTokenLargestAccounts(tokenAccount);
+        
+        // Check if top 5 holders own more than 50% of supply
+        const totalSupply = supplyInfo.value.amount;
+        const top5Percentage = largestAccounts.value
+            .slice(0, 5)
+            .reduce((sum, acc) => sum + Number(acc.amount), 0) / totalSupply;
+            
+        return top5Percentage <= 0.5; // True if <=50% concentrated
+    } catch (error) {
+        throw new Error(`Distribution check failed: ${error.message}`);
+    }
+}
+
+async function checkTokenDistribution(tokenAccount) {
+    try {
+        const isFair = await analyzeTokenDistribution(tokenAccount);
+        if (!isFair) throw new Error("High concentration detected");
+        console.log("✅ Fair distribution");
+        return true;
+    } catch (error) {
+        console.error("Distribution check failed:", error.message);
+        return false;
+    }
+}
+
+const JSONStream = require('JSONStream');
+
+async function getPoolKeys(tokenAccount) {
+    return new Promise((resolve, reject) => {
+        const parser = JSONStream.parse('*');
+        let foundPool = null;
+        
+        fetch('https://api.raydium.io/v2/sdk/liquidity/mainnet.json')
+            .then(res => {
+                res.body
+                    .pipe(parser)
+                    .on('data', (pool) => {
+                        if ((pool.baseMint === tokenAccount.toBase58() || 
+                            pool.quoteMint === tokenAccount.toBase58()) && !foundPool) {
+                            foundPool = pool;
+                            res.body.destroy(); // Stop processing once found
+                            resolve({
+                                id: new PublicKey(pool.id),
+                                baseMint: new PublicKey(pool.baseMint),
+                                quoteMint: new PublicKey(pool.quoteMint)
+                            });
+                        }
+                    })
+                    .on('end', () => {
+                        if (!foundPool) reject(new Error("Pool not found"));
+                    });
+            })
+            .catch(reject);
+    });
+}
+
+async function checkHoneypot(tokenAccount) {
+    try {
+        const [buyOutput, sellOutput] = await Promise.all([
+            simulateTrade(tokenAccount, 'buy'),
+            simulateTrade(tokenAccount, 'sell')
+        ]);
+
+        // Calculate price impact properly
+        const midPrice = (buyOutput + sellOutput) / 2;
+        const priceImpact = Math.abs((buyOutput - sellOutput) / midPrice);
+        
+        return priceImpact > 0.3; // 30% impact threshold
+    } catch (error) {
+        throw new Error(`Honeypot detection failed: ${error.message}`);
+    }
+}
+
+async function createSwapInstruction(poolKeys, amount, direction) {
+    const instruction = new TransactionInstruction({
+        programId: new PublicKey(RAYDIUM_PUBLIC_KEY),
+        keys: [
+            { pubkey: poolKeys.id, isSigner: false, isWritable: true },
+            { pubkey: await getAssociatedTokenAddress(
+                direction === 'buy' ? poolKeys.baseMint : poolKeys.quoteMint,
+                wallet.publicKey
+            ), isSigner: false, isWritable: true },
+            { pubkey: poolKeys.baseMint, isSigner: false, isWritable: false },
+            { pubkey: poolKeys.quoteMint, isSigner: false, isWritable: false },
+            { pubkey: wallet.publicKey, isSigner: true, isWritable: false },
+        ],
+        data: Buffer.from([
+            direction === 'buy' ? 1 : 0,
+            ...new Uint8Array(new BigUint64Array([BigInt(amount)]).buffer)
+        ])
+    });
+
+    return instruction;
+}
+
+async function simulateTrade(tokenAccount, direction) {
+    return throttledRpcCall(async () => {
+        try {
+            console.log(`=== Starting ${direction.toUpperCase()} simulation ===`);
+            
+            const poolKeys = await getPoolKeys(tokenAccount);
+            if (!poolKeys?.id || !poolKeys.baseMint || !poolKeys.quoteMint) {
+                throw new Error("Invalid pool keys structure");
+            }
+
+            // Validate token account matches pool
+            if (![poolKeys.baseMint, poolKeys.quoteMint].includes(tokenAccount.toBase58())) {
+                throw new Error("Token not found in pool pair");
+            }
+
+            // Calculate amount with slippage buffer
+            const amount = direction === 'buy' 
+                ? SIMULATION_AMOUNT * (1 + SLIPPAGE)
+                : SIMULATION_AMOUNT * (1 - SLIPPAGE);
+
+            console.log(`Simulating swap of ${amount} tokens`);
+
+            // Build transaction
+            const swapInstruction = await createSwapInstruction(poolKeys, amount, direction);
+            const transaction = new Transaction().add(swapInstruction);
+            
+            // Get fresh blockhash
+            const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash();
+            transaction.recentBlockhash = blockhash;
+            transaction.lastValidBlockHeight = lastValidBlockHeight;
+            transaction.feePayer = wallet.publicKey;
+
+            // Simulate with full context
+            const simulation = await connection.simulateTransaction(transaction, {
+                sigVerify: true,
+                replaceRecentBlockhash: true,
+                commitment: 'confirmed'
+            });
+
+            if (simulation.value.err) {
+                throw new Error(`Simulation failed: ${JSON.stringify(simulation.value.err)}`);
+            }
+
+            // Return simulated token amount
+            const tokenIndex = direction === 'buy' ? 0 : 1;
+            return simulation.value.accounts[tokenIndex]?.preBalance || 0;
+            
+        } catch (error) {
+            console.error(`Trade simulation failed (${direction}):`, error);
+            throw error; // Ensure error propagates
+        }
+    });
+}
+
+
+async function getPoolKeys(tokenAccount) {
+    try {
+        console.log(`Fetching pool keys for token: ${tokenAccount.toBase58()}`);
+        
+        const response = await fetch(`https://api.raydium.io/v2/ammV3/ammPools?baseMint=${tokenAccount.toBase58()}`);
+        
+        if (!response.ok) {
+            const errorBody = await response.text();
+            throw new Error(`API Error: ${response.status} - ${errorBody}`);
+        }
+
+        const data = await response.json();
+        if (!data?.data || !Array.isArray(data.data)) {
+            throw new Error("Invalid response structure from Raydium API");
+        }
+
+        const poolKeys = data.data.find(pool => 
+            pool.baseMint === tokenAccount.toBase58() ||
+            pool.quoteMint === tokenAccount.toBase58()
+        );
+
+        if (!poolKeys) throw new Error("No pool found");
+        
+        return {
+            id: new PublicKey(poolKeys.id),
+            baseMint: new PublicKey(poolKeys.baseMint),
+            quoteMint: new PublicKey(poolKeys.quoteMint)
+        };
+    } catch (error) {
+        console.error("Error in getPoolKeys:", error);
+        throw error;
+    }
+}
+
+async function buyToken(tokenAccount) {
+  try {
+      const solPrice = await getSolPrice();
+      const amountLamports = calculateLamports(TRADE_AMOUNT_USD, solPrice);
+
+      const associatedAccount = await getAssociatedTokenAddress(
+          tokenAccount,
+          wallet.publicKey
+      );
+
+      const instruction = createTransferInstruction(
+          associatedAccount,
+          associatedAccount,
+          wallet.publicKey,
+          amountLamports
+      );
+
+      const transaction = new Transaction().add(instruction);
+      const { blockhash } = await connection.getRecentBlockhash();
+      transaction.recentBlockhash = blockhash;
+      transaction.feePayer = wallet.publicKey;
+
+      const signedTx = await wallet.signTransaction(transaction);
+      const txid = await connection.sendRawTransaction(signedTx.serialize());
+      
+      console.log(`Successfully bought $${TRADE_AMOUNT_USD} worth: ${txid}`);
+      
+      const buyPrice = await getTokenPrice(tokenAccount);
+      monitorProfit(tokenAccount, buyPrice);
+      
+      return txid;
+  } catch (error) {
+      console.error("Buy failed:", error);
+      return null;
+  }
+}
+
+async function getTokenPrice(tokenAccount) {
+    try {
+        const response = await fetch(`https://api.raydium.io/v2/main/price?token=${tokenAccount.toBase58()}`);
+        const data = await response.json();
+        return data.price;
+    } catch (error) {
+        console.error("Price check failed:", error);
+        return null;
+    }
+}
+
+async function sellToken(tokenAccount) {
+    try {
+        const associatedAccount = await getAssociatedTokenAddress(
+            tokenAccount,
+            wallet.publicKey
+        );
+
+        const balance = await connection.getTokenAccountBalance(associatedAccount);
+        const amount = balance.value.amount;
+
+        const instruction = createTransferInstruction(
+            associatedAccount,
+            wallet.publicKey, // Send to wallet
+            wallet.publicKey,
+            amount
+        );
+
+        const transaction = new Transaction().add(instruction);
+        const { blockhash } = await connection.getRecentBlockhash();
+        transaction.recentBlockhash = blockhash;
+        transaction.feePayer = wallet.publicKey;
+
+        const signedTx = await wallet.signTransaction(transaction);
+        const txid = await connection.sendRawTransaction(signedTx.serialize());
+        
+        console.log(`✅ Successfully sold token: ${txid}`);
+        return txid;
+    } catch (error) {
+        console.error("Sell failed:", error);
+        return null;
+    }
+}
+
+async function monitorProfit(tokenAccount, buyPrice) {
+  try {
+      while (true) {
+          const currentPrice = await getTokenPrice(tokenAccount);
+          if (currentPrice >= buyPrice * TAKE_PROFIT) {
+              await sellToken(tokenAccount);
+              break;
+          }
+          await new Promise(resolve => setTimeout(resolve, 30000)); // Check every 30s
+      }
+  } catch (error) {
+      console.error("Profit monitoring failed:", error);
+  }
+}
+
+async function withRetry(fn, retries = 3) {
+    try {
+      return await fn();
+    } catch (error) {
+      if (error.message.includes('429') && retries > 0) {
+        const delay = 2 ** (4 - retries) * 1000; // Exponential backoff
+        await new Promise(resolve => setTimeout(resolve, delay));
+        return withRetry(fn, retries - 1);
+      }
+      throw error;
+    }
+}
