@@ -1,0 +1,77 @@
+🔒 Token Security Checks
+
+    Ownership Check
+
+        Verifies if mint authority exists (centralized token = red flag)
+
+    Blacklist Check
+
+        Cross-references known scam token databases
+
+    Mint Address Validation
+
+        Confirms the token's mint account is legitimate
+
+    Account Existence Check
+
+        Validates the token account is properly initialized
+
+💧 Liquidity Checks
+
+    Liquidity Lock
+
+        Checks for freeze authority (indicates locked liquidity)
+
+    Owner Pool Access
+
+        Detects if creator controls the LP (centralization risk)
+
+    Token Distribution
+
+        Analyzes top holders for excessive concentration (>50% = unsafe)
+
+🛡️ Transaction Safety
+
+    Basic TX Simulation
+
+        Tests if transfers are possible
+
+    Approval/Transfer Check
+
+        Verifies the token isn't transfer-restricted
+
+🕵️ Advanced Scam Detection
+
+    Honeypot Check
+
+        Simulates buys/sells to detect price manipulation
+
+    Burn Mechanism Check
+
+        Validates token has proper burn functionality
+
+    Renounced Ownership
+
+        Checks if mint authority is null (fully decentralized)
+
+📊 Check Summary Table
+#	Check Name	Purpose	Risk If Failed
+1	Ownership Check	Detect centralized control	Rug pull risk
+2	Blacklist Check	Identify known scams	Loss of funds
+3	Mint Address Validation	Verify token legitimacy	Fake token
+4	Account Existence	Confirm proper initialization	Non-tradable token
+5	Liquidity Lock	Check LP locking	Immediate liquidity removal
+6	Owner Pool Access	Detect LP control	Creator drain risk
+7	Token Distribution	Analyze holder concentration	Pump-and-dump risk
+8	Basic TX Simulation	Test transfer functionality	Frozen token
+9	Approval/Transfer	Verify transfer permissions	Non-transferable token
+10	Honeypot Check	Detect buy/sell traps	Funds stuck
+11	Burn Mechanism	Validate token economics	Hyperinflation risk
+12	Renounced Ownership	Confirm full decentralization	Hidden admin functions
+🛠️ Implementation Notes
+
+    Each check has independent failure handling (won't crash the bot)
+
+    Results are cached for 150 tokens (MAX_CACHE_SIZE)
+
+    Checks run in batches with delays to avoid rate limiting
