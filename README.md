@@ -19,7 +19,7 @@ A high-frequency trading bot that detects and exploits arbitrage opportunities b
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/yourusername/solana-arbitrage-bot.git
+   git clone https://github.com/QuantAlpha1/solana-arbitrage-bot.git
    cd solana-arbitrage-bot
 
     Install dependencies:
